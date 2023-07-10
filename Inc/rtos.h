@@ -2,7 +2,7 @@
  * rtos.h
  *
  *  Created on: Oct 19, 2022
- *      Author: LARL
+ *      Author: LetraGis
  */
 
 #ifndef RTOS_H_
@@ -27,6 +27,7 @@ typedef struct
 {
 	void *sp; /* Stack Pointer */
 	uint32_t timeout; /* timeout delay down-counter */
+   uint8_t prio; /* thread priority */
 } OSThread;
 
 typedef void (*OSThreadHandler)();
@@ -77,6 +78,7 @@ void OS_onIdle_Callback(void);
 void OSThread_Start(
 		OSThread *me,
 		OSThreadHandler threadHandler,
+      uint8_t prio, /* thread priority */
 		void *stkSto, uint32_t stkSize);
 
 /******************************************************************************
