@@ -10,14 +10,13 @@ EXTERNAL DEPENDENCIES
 ******************************************************************************/
 
 #include "rtos.h"
-#include "qassert.h"
 #include "stm32f446xx.h"
 
 /******************************************************************************
 MODULE DEFINES
 ******************************************************************************/
 
-Q_DEFINE_THIS_FILE
+#define LOG2(x) (32U - __CLZ(x))
 
 /******************************************************************************
 MODULE TYPES
@@ -48,17 +47,19 @@ OSThread * volatile OS_Next;
    corresponding arguments. */
 OSThread *OS_Thread[32 + 1];
 /* Keeps track of the number of the thread being executed. */
-uint8_t OS_ThreadNum;
+//uint8_t OS_ThreadNum;
 /* Index that keeps track of the current index on the array of threads. Since
    this RTOS is using Round-Robin Algorithm for task scheduling, all created 
    threads are stored in an array. This index ensures that we are pointing to 
    the correct thread. */
-uint8_t OS_CurrIdx;
+//uint8_t OS_CurrIdx;
 /* This bitfield is used to tell if the thread is ready to run (1U) or thread is
    blocked (0U). It is used by the scheduling function OS_Sched() to determine
    which tasks are ready to run, or if no tasks are ready, execute the Idle
    thread. */
 uint32_t OS_readySet; 
+
+uint32_t OS_delayedSet;
 
 /******************************************************************************
 DEFINITION OF LOCAL CONSTANT DATA
@@ -110,6 +111,7 @@ void OS_Init(void *stkSto, uint32_t stkSize)
 	   Idle thread stack as well as its size. */
     OSThread_Start(&idleThread,
                    &main_idleThread,
+                   0U,
                    stkSto, stkSize);
 }
 
@@ -122,30 +124,23 @@ void OS_Init(void *stkSto, uint32_t stkSize)
  ******************************************************************************/
 void OS_Sched(void)
 {
-
-	/* Round-Robin algorithm implementation. If the bitfield is equal to 0,
+    /* temporary for the next thread */
+    OSThread * next;
+	
+    /* Round-Robin algorithm implementation. If the bitfield is equal to 0,
 	   it means that no thread is ready to be executed. */
-    if (OS_readySet == 0U) { /* idle condition? */
+    if (OS_readySet == 0U) /* idle condition? */
+    { 
 		/* If no thread is in ready state, the control will be passed to Idle
 		   thread, which has index 0 in the array. */
-        OS_CurrIdx = 0U; /* index of the idle thread */
+        next = OS_Thread[0U]; /* index of the idle thread */
     }
-    else {
-        do {
-            ++OS_CurrIdx;
-			/* If the current index is equal to number of started threads,
-			   go back and execute the first thread (which is in this case
-			   the one with index 1U, because the index 0U is reserved for Idle
-			   thread). This is only executed while the corresponding bit in 
-			   the bitfield is not set (it means, the thread is not ready to 
-               run). */
-            if (OS_CurrIdx == OS_ThreadNum) {
-                OS_CurrIdx = 1U;
-            }
-        } while ((OS_readySet & (1U << (OS_CurrIdx - 1U))) == 0U);
+    else 
+    {
+        next = OS_Thread[LOG2(OS_readySet)];
+        // Q_ASSERT(next != (OSThread *)0U);
     }
-    /* temporary for the next thread */
-    OSThread * const next = OS_Thread[OS_CurrIdx];
+    
 
 	if(next != OS_Curr)
 	{
@@ -176,7 +171,7 @@ void OS_Run(void)
     OS_Sched();
     __enable_irq();
 
-	Q_ERROR();
+	// Q_ERROR();
 }
 
 /*!****************************************************************************
@@ -192,13 +187,16 @@ void OS_delay(uint32_t ticks)
     __disable_irq();
 
     /* never call OS_delay from the idleThread */
-    Q_REQUIRE(OS_Curr != OS_Thread[0]);
+    // Q_REQUIRE(OS_Curr != OS_Thread[0]);
 
 	/* Assign the number of given ticks (for delay) to corresponding member. */
     OS_Curr->timeout = ticks;
 	/* The task will be set immediately to blocked state (clearing its
-	   corresponding bit). */
-    OS_readySet &= ~(1U << (OS_CurrIdx - 1U));
+	   corresponding bit in the OS_readySet). */
+    OS_readySet &= ~(1U << (OS_Curr->prio - 1U));
+	/* The task will be set immediately to blocked state (setting its
+	   corresponding bit in the OS_delayedSet). */
+    OS_delayedSet |= (1U << (OS_Curr->prio - 1U));
     /* By calling the scheduler, the control will be taken from the blocked
 	   task and the next available task will be executed. */
 	OS_Sched();
@@ -217,19 +215,21 @@ void OS_delay(uint32_t ticks)
  * @return         	void    No output parameters.
  ******************************************************************************/
 void OS_Tick(void) {
-    uint8_t n;
+    uint32_t workingSet = OS_delayedSet;
 	/* Loop through all started threads except index 0 (which is reserved for
 	   Idle thread). */
-    for (n = 1U; n < OS_ThreadNum; ++n) {
-		/* Only decrement the timeout when is greater than 0U; */
-        if (OS_Thread[n]->timeout != 0U) {
-            --OS_Thread[n]->timeout;
-			/* If timer is expired, task is ready to run (bit in bitfield for
-			   corresponding thread is set). */
-            if (OS_Thread[n]->timeout == 0U) {
-                OS_readySet |= (1U << (n - 1U));
-            }
+    while (workingSet != 0U) {
+        OSThread *t = OS_Thread[LOG2(workingSet)];
+        uint32_t bit;
+        // Q_ASSERT((t != (OSThread *)0) && (t->timeout != 0U));
+
+        bit = (1U << (t->prio - 1U));
+        --t->timeout;
+        if (t->timeout == 0U) {
+            OS_readySet   |= bit;  /* insert to set */
+            OS_delayedSet &= ~bit; /* remove from set */
         }
+        workingSet &= ~bit; /* remove from working set */
     }
 }
 
@@ -244,8 +244,12 @@ void OS_Tick(void) {
 void OSThread_Start(
 		OSThread *me,
 		OSThreadHandler threadHandler,
+        uint8_t prio, /* thread priority */
 		void *stkSto, uint32_t stkSize)
 {
+
+    // Q_REQUIRE((prio < Q_DIM(OS_Thread)) && OS_Thread[prio] == (OSThread *)0U);
+
     /* round down the stack top to the 8-byte boundary
     * NOTE: ARM Cortex-M stack grows down from hi -> low memory
     */
@@ -280,15 +284,14 @@ void OSThread_Start(
     for (sp = sp - 1U; sp >= stk_limit; --sp) {
         *sp = 0xDEADBEEFU;
     }
-
-	Q_ASSERT(OS_ThreadNum < Q_DIM(OS_Thread));
 	
-	OS_Thread[OS_ThreadNum] = me;
+	OS_Thread[prio] = me;
+    me->prio = prio;
     /* make the thread ready to run */
-    if (OS_ThreadNum > 0U) {
-        OS_readySet |= (1U << (OS_ThreadNum - 1U));
+    if (prio > 0U) {
+        OS_readySet |= (1U << (prio - 1U));
     }
-	++OS_ThreadNum;	
+
 }
 
 /*!****************************************************************************
